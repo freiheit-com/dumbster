@@ -35,7 +35,7 @@ public class SimpleSmtpServer implements Runnable {
   /**
    * Stores all of the email received since this instance started up.
    */
-  private List receivedMail;
+  private List<SmtpMessage> receivedMail;
 
   /**
    * Default SMTP port is 25.
@@ -46,6 +46,16 @@ public class SimpleSmtpServer implements Runnable {
    * Indicates whether this server is stopped or not.
    */
   private volatile boolean stopped = true;
+
+  /**
+   * Indicates whether the start of the server failed.
+   */
+  private volatile boolean failed = false;
+  
+  /**
+   * If available, the exception causing the failure.
+   */
+  private volatile Throwable failCause;
 
   /**
    * Handle to the server socket this server listens to.
@@ -67,7 +77,7 @@ public class SimpleSmtpServer implements Runnable {
    * @param port port number
    */
   public SimpleSmtpServer(int port) {
-    receivedMail = new ArrayList();
+    receivedMail = new ArrayList<SmtpMessage>();
     this.port = port;
   }
 
@@ -75,11 +85,11 @@ public class SimpleSmtpServer implements Runnable {
    * Main loop of the SMTP server.
    */
   public void run() {
-    stopped = false;
     try {
       try {
         serverSocket = new ServerSocket(port);
         serverSocket.setSoTimeout(TIMEOUT); // Block for maximum of 1.5 seconds
+        stopped = false;
       } finally {
         synchronized (this) {
           // Notify when server socket has been created
@@ -111,20 +121,27 @@ public class SimpleSmtpServer implements Runnable {
            * For higher concurrency, we could just change handle to return void and update the list inside the method
            * to limit the duration that we hold the lock.
            */
-          List msgs = handleTransaction(out, input);
+          List<SmtpMessage> msgs = handleTransaction(out, input);
           receivedMail.addAll(msgs);
         }
         socket.close();
       }
     } catch (Exception e) {
       /** @todo Should throw an appropriate exception here. */
-      e.printStackTrace();
+      // e.printStackTrace();
+      stopped = true;
+      failed = true;
+      failCause = e;
+      synchronized (this) {
+        // Notify when server socket has been created
+        notifyAll();
+      }
     } finally {
       if (serverSocket != null) {
         try {
           serverSocket.close();
         } catch (IOException e) {
-          e.printStackTrace();
+          // e.printStackTrace();
         }
       }
     }
@@ -137,6 +154,24 @@ public class SimpleSmtpServer implements Runnable {
    */
   public synchronized boolean isStopped() {
     return stopped;
+  }
+
+  /** 
+   * Check if server has failed to start.
+   *
+   * @return true if the server has failed to start
+   */ 
+  public synchronized boolean hasFailed() {
+    return failed;
+  }
+  
+  /**
+   * Returns the exception causing the failure. 
+   * 
+   * @return the exception or null if no exception is available.
+   */
+  public synchronized Throwable getFailCause() {
+      return failCause;
   }
 
   /**
@@ -163,7 +198,7 @@ public class SimpleSmtpServer implements Runnable {
    * @return List of SmtpMessage
    * @throws IOException
    */
-  private List handleTransaction(PrintWriter out, BufferedReader input) throws IOException {
+  private List<SmtpMessage> handleTransaction(PrintWriter out, BufferedReader input) throws IOException {
     // Initialize the state machine
     SmtpState smtpState = SmtpState.CONNECT;
     SmtpRequest smtpRequest = new SmtpRequest(SmtpActionType.CONNECT, "", smtpState);
@@ -175,7 +210,7 @@ public class SimpleSmtpServer implements Runnable {
     sendResponse(out, smtpResponse);
     smtpState = smtpResponse.getNextState();
 
-    List msgList = new ArrayList();
+    List<SmtpMessage> msgList = new ArrayList<SmtpMessage>();
     SmtpMessage msg = new SmtpMessage();
 
     while (smtpState != SmtpState.CONNECT) {
@@ -226,7 +261,7 @@ public class SimpleSmtpServer implements Runnable {
    * Get email received by this instance since start up.
    * @return List of String
    */
-  public synchronized Iterator getReceivedEmail() {
+  public synchronized Iterator<SmtpMessage> getReceivedEmail() {
     return receivedMail.iterator();
   }
 
@@ -263,7 +298,9 @@ public class SimpleSmtpServer implements Runnable {
     // Block until the server socket is created
     synchronized (server) {
       try {
-        server.wait();
+        while (server.isStopped() && !server.hasFailed()) {
+          server.wait(TIMEOUT);
+        }
       } catch (InterruptedException e) {
         // Ignore don't care.
       }
